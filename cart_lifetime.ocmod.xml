@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<modification>
+    <name>Cart Cookie Hash 2 - DRY &amp; Proxy Aware (Optimised)</name>
+    <code>cart_cookie_hash_2_dry</code>
+    <version>1.5</version>
+    <author>Yoda &amp; Optimised</author>
+
+    <file path="system/library/cart/cart.php">
+
+        <operation>
+            <search><![CDATA[$this->db->query("DELETE FROM " . DB_PREFIX . "cart WHERE (api_id > '0' OR customer_id = '0') AND date_added < DATE_SUB(NOW(), INTERVAL 1 HOUR)");]]></search>
+            <add position="replace"><![CDATA[
+            // [START] Safe & Optimised Persistent Cart Logic
+            if (isset($_COOKIE['cart_hash'])) {
+                $cart_hash = preg_replace('%[^A-Za-z0-9]%', '', $_COOKIE['cart_hash']);
+                $current_session = $this->session->getId();
+
+                // Проверяем, авторизован ли юзер. Если авторизован — не трогаем гостевую логику кук здесь
+                $is_guest = empty($this->session->data['customer_id']);
+
+                if ($is_guest && $cart_hash != $current_session && !isset($this->session->data['cart_hash_updated'])) {
+                    $this->db->query("UPDATE " . DB_PREFIX . "cart SET session_id = '" . $this->db->escape($current_session) . "' WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $this->db->escape($cart_hash) . "'");
+
+                    // Фиксируем в сессии, что апдейт для этого хита выполнен, не нужно повторять при перезагрузках
+                    $this->session->data['cart_hash_updated'] = true;
+
+                    $p = $this->get_cookie_params();
+                    setcookie('cart_hash', $current_session, time() + 86400 * 30, $p['path'], $p['domain'], $p['secure'], true);
+                }
+            }
+
+            // Запускаем очистку корзины ОЧЕНЬ редко (с вероятностью 0.1%), а не на каждый чих пользователя
+            if (rand(1, 1000) === 500) {
+                $this->db->query("DELETE FROM " . DB_PREFIX . "cart WHERE (api_id > '0' OR customer_id = '0') AND date_added < DATE_SUB(NOW(), INTERVAL 720 HOUR)");
+            }
+            // [END] Safe & Optimised Persistent Cart Logic
+            ]]></add>
+        </operation>
+
+        <operation>
+            <search><![CDATA[public function getProducts() {]]></search>
+            <add position="before"><![CDATA[
+  private function get_cookie_params() {
+    return [
+      'secure' => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https'),
+      'path'   => !empty(ini_get('session.cookie_path')) ? ini_get('session.cookie_path') : '/',
+      'domain' => !empty(ini_get('session.cookie_domain')) ? ini_get('session.cookie_domain') : '',
+    ];
+  }
+
+  public function set_cart_cookie() {
+    // Ставим куку ТОЛЬКО если пользователь — анонимный гость
+    if (empty($this->session->data['customer_id'])) {
+        if (!isset($_COOKIE['cart_hash']) || $_COOKIE['cart_hash'] != $this->session->getId()) {
+          $p = $this->get_cookie_params();
+          setcookie('cart_hash', $this->session->getId(), time() + 86400 * 30, $p['path'], $p['domain'], $p['secure'], true);
+        }
+    }
+  }
+            ]]></add>
+        </operation>
+
+        <operation>
+            <search trim="true"><![CDATA[public function add(]]></search>
+            <add position="after"><![CDATA[    $this->set_cart_cookie();]]></add>
+        </operation>
+
+        <operation>
+            <search trim="true"><![CDATA[public function update(]]></search>
+            <add position="after"><![CDATA[    $this->set_cart_cookie();]]></add>
+        </operation>
+
+        <operation>
+            <search trim="true"><![CDATA[public function remove(]]></search>
+            <add position="after"><![CDATA[    $this->set_cart_cookie();]]></add>
+        </operation>
+
+        <operation>
+            <search trim="true"><![CDATA[public function clear(]]></search>
+            <add position="after"><![CDATA[    $this->set_cart_cookie();]]></add>
+        </operation>
+
+    </file>
+</modification>
