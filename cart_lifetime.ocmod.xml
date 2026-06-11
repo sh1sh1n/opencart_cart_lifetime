@@ -64,23 +64,27 @@
         </operation>
 
         <operation>
-            <search regex="true"><![CDATA[/public function add\(.*?\)\s*\{/s]]></search>
-            <add position="after"><![CDATA[        $this->set_cart_cookie();]]></add>
+            <search trim="true"><![CDATA[public function add($product_id, $quantity = 1, $option = array(), $recurring_id = 0) {]]></search>
+            <add position="after"><![CDATA[
+        $this->set_cart_cookie();]]></add>
         </operation>
 
         <operation>
-            <search regex="true"><![CDATA[/public function update\(.*?\)\s*\{/s]]></search>
-            <add position="after"><![CDATA[        $this->set_cart_cookie();]]></add>
+            <search trim="true"><![CDATA[public function update($cart_id, $quantity) {]]></search>
+            <add position="after"><![CDATA[
+        $this->set_cart_cookie();]]></add>
         </operation>
 
         <operation>
-            <search regex="true"><![CDATA[/public function remove\(.*?\)\s*\{/s]]></search>
-            <add position="after"><![CDATA[        $this->set_cart_cookie();]]></add>
+            <search trim="true"><![CDATA[public function remove($cart_id) {]]></search>
+            <add position="after"><![CDATA[
+        $this->set_cart_cookie();]]></add>
         </operation>
 
         <operation>
-            <search regex="true"><![CDATA[/public function clear\(.*?\)\s*\{/s]]></search>
-            <add position="after"><![CDATA[        $this->set_cart_cookie();]]></add>
+            <search trim="true"><![CDATA[public function clear() {]]></search>
+            <add position="after"><![CDATA[
+        $this->set_cart_cookie();]]></add>
         </operation>
 
     </file>
