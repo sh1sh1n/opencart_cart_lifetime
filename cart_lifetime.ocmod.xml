@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <modification>
-    <name>Cart Cookie Hash 2 - Ultimate Edition</name>
+    <name>Cart Cookie Hash 2 - Ultimate Edition v1.7</name>
     <code>cart_cookie_hash_2_ultimate</code>
-    <version>1.6</version>
+    <version>1.7</version>
     <author>Yoda &amp; Optimised</author>
 
     <file path="system/library/cart/cart.php">
@@ -15,26 +15,33 @@
                 $cart_hash = preg_replace('%[^A-Za-z0-9]%', '', $_COOKIE['cart_hash']);
                 $current_session = $this->session->getId();
 
-                // Check if user is a guest using the customer object
                 $is_guest = !$this->customer->isLogged();
 
                 if ($is_guest && $cart_hash != $current_session && !isset($this->session->data['cart_hash_updated'])) {
                     $this->db->query("UPDATE " . DB_PREFIX . "cart SET session_id = '" . $this->db->escape($current_session) . "' WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $this->db->escape($cart_hash) . "'");
 
-                    // Flag to prevent redundant execution
                     $this->session->data['cart_hash_updated'] = true;
 
                     $p = $this->get_cookie_params();
-                    setcookie('cart_hash', $current_session, time() + 86400 * 30, $p['path'], $p['domain'], $p['secure'], true);
                     
-                    // Update the superglobal immediately so subsequent calls in this lifecycle know it exists
+                    // PHP 7.3+ array syntax for modern security policies
+                    setcookie('cart_hash', $current_session, [
+                        'expires'  => time() + 86400 * 30,
+                        'path'     => $p['path'],
+                        'domain'   => $p['domain'],
+                        'secure'   => $p['secure'],
+                        'httponly' => true,
+                        'samesite' => 'Lax'
+                    ]);
+                    
                     $_COOKIE['cart_hash'] = $current_session;
                 }
             }
 
-            // 0.1% chance garbage collection to clean up 30-day old abandoned carts
-            if (rand(1, 1000) === 500) {
-                $this->db->query("DELETE FROM " . DB_PREFIX . "cart WHERE (api_id > '0' OR customer_id = '0') AND date_added < DATE_SUB(NOW(), INTERVAL 720 HOUR)");
+            // Split DELETE queries with LIMIT to prevent InnoDB gap locking and deadlocks
+            if (mt_rand(1, 1000) === 500) {
+                $this->db->query("DELETE FROM " . DB_PREFIX . "cart WHERE api_id > '0' AND date_added < DATE_SUB(NOW(), INTERVAL 720 HOUR) LIMIT 200");
+                $this->db->query("DELETE FROM " . DB_PREFIX . "cart WHERE api_id = '0' AND customer_id = '0' AND date_added < DATE_SUB(NOW(), INTERVAL 720 HOUR) LIMIT 500");
             }
             // [END] Safe & Optimised Persistent Cart Logic
             ]]></add>
@@ -55,7 +62,16 @@
     if (!$this->customer->isLogged()) {
         if (!isset($_COOKIE['cart_hash']) || $_COOKIE['cart_hash'] != $this->session->getId()) {
           $p = $this->get_cookie_params();
-          setcookie('cart_hash', $this->session->getId(), time() + 86400 * 30, $p['path'], $p['domain'], $p['secure'], true);
+          
+          setcookie('cart_hash', $this->session->getId(), [
+              'expires'  => time() + 86400 * 30,
+              'path'     => $p['path'],
+              'domain'   => $p['domain'],
+              'secure'   => $p['secure'],
+              'httponly' => true,
+              'samesite' => 'Lax'
+          ]);
+          
           $_COOKIE['cart_hash'] = $this->session->getId();
         }
     }
