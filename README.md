@@ -135,7 +135,7 @@ Combined with this OCMOD, it provides complete protection against lock-related c
 
 | Version | Changes |
 |---|---|
-| **1.6** | `regex="true"` for reliable hook insertion after `{`; `&amp;` XML escape fix (resolves admin 500 on modification refresh); `$_COOKIE` superglobal updated immediately after session migration |
+| **1.6** | `&amp;` XML escape fix (resolves admin 500 on modification refresh); exact full signatures with `{` for hook insertion — no `regex`, no `trim` on hooks; `$_COOKIE` superglobal updated immediately after session migration; guest-only guard on `set_cart_cookie()` |
 | **1.5** | DRY refactor — `get_cookie_params()` helper; session cookie path/domain fallback logic |
 | **1.4** | `get_cookie_params()` introduced to eliminate duplicate cookie config |
 | **1.3** | Proxy-aware HTTPS detection via `HTTP_X_FORWARDED_PROTO` |
