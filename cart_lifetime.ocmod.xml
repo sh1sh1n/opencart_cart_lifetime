@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <modification>
-    <name>Cart Cookie Hash 2 - Ultimate Edition v1.7</name>
+    <name>Cart Cookie Hash 2 - Ultimate Edition v1.9</name>
     <code>cart_cookie_hash_2_ultimate</code>
-    <version>1.7</version>
+    <version>1.9</version>
     <author>Yoda &amp; Optimised</author>
 
     <file path="system/library/cart/cart.php">
@@ -10,46 +10,72 @@
         <operation>
             <search><![CDATA[$this->db->query("DELETE FROM " . DB_PREFIX . "cart WHERE (api_id > '0' OR customer_id = '0') AND date_added < DATE_SUB(NOW(), INTERVAL 1 HOUR)");]]></search>
             <add position="replace"><![CDATA[
-            // [START] Safe & Optimised Persistent Cart Logic
-            if (isset($_COOKIE['cart_hash'])) {
-                $cart_hash = preg_replace('%[^A-Za-z0-9]%', '', $_COOKIE['cart_hash']);
+            // [START] Persistent guest cart + throttled garbage collection
+            //
+            // headers_sent() is a PRECONDITION, not a late check. If the new cart_hash
+            // cannot be persisted, the rows must not be moved either - otherwise they end
+            // up orphaned on a session ID no cookie points to, and the cart silently
+            // disappears once that session expires.
+            if (isset($_COOKIE['cart_hash']) && !$this->customer->isLogged() && !$this->cart_hash_merged && !headers_sent()) {
+                $cart_hash       = (string)$_COOKIE['cart_hash'];
                 $current_session = $this->session->getId();
 
-                $is_guest = !$this->customer->isLogged();
+                // OpenCart's own session ID format is /^[a-zA-Z0-9,\-]{22,52}$/ (see Session::start()).
+                // Validate the raw value - never strip characters, or a legitimate ID gets corrupted
+                // and the migration silently matches nothing.
+                if (preg_match('/^[a-zA-Z0-9,\-]{22,52}$/D', $cart_hash) && $cart_hash !== $current_session) {
+                    $this->cart_hash_merged = true;
 
-                if ($is_guest && $cart_hash != $current_session && !isset($this->session->data['cart_hash_updated'])) {
-                    $this->db->query("UPDATE " . DB_PREFIX . "cart SET session_id = '" . $this->db->escape($current_session) . "' WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $this->db->escape($cart_hash) . "'");
+                    $old_sid = $this->db->escape($cart_hash);
+                    $new_sid = $this->db->escape($current_session);
 
-                    $this->session->data['cart_hash_updated'] = true;
+                    // Cheap indexed probe. A collision needs the destination session to already
+                    // hold the same product_id + recurring_id + option, which is rare, so the
+                    // common path stays a single narrow UPDATE.
+                    $collision = $this->db->query("SELECT COUNT(*) AS total FROM " . DB_PREFIX . "cart src INNER JOIN " . DB_PREFIX . "cart dst ON (dst.product_id = src.product_id AND dst.recurring_id = src.recurring_id AND dst.`option` = src.`option`) WHERE src.api_id = '0' AND src.customer_id = '0' AND src.session_id = '" . $old_sid . "' AND dst.api_id = '0' AND dst.customer_id = '0' AND dst.session_id = '" . $new_sid . "'");
 
-                    $p = $this->get_cookie_params();
-                    
-                    // PHP 7.3+ array syntax for modern security policies
-                    setcookie('cart_hash', $current_session, [
-                        'expires'  => time() + 86400 * 30,
-                        'path'     => $p['path'],
-                        'domain'   => $p['domain'],
-                        'secure'   => $p['secure'],
-                        'httponly' => true,
-                        'samesite' => 'Lax'
-                    ]);
-                    
-                    $_COOKIE['cart_hash'] = $current_session;
+                    if (!empty($collision->row['total'])) {
+                        // Aggregate rather than move blindly, otherwise the customer ends up
+                        // with two identical lines instead of a summed quantity.
+                        $this->db->query("START TRANSACTION");
+
+                        $this->db->query("UPDATE " . DB_PREFIX . "cart dst INNER JOIN " . DB_PREFIX . "cart src ON (dst.product_id = src.product_id AND dst.recurring_id = src.recurring_id AND dst.`option` = src.`option`) SET dst.quantity = dst.quantity + src.quantity, dst.date_added = NOW() WHERE dst.api_id = '0' AND dst.customer_id = '0' AND dst.session_id = '" . $new_sid . "' AND src.api_id = '0' AND src.customer_id = '0' AND src.session_id = '" . $old_sid . "'");
+
+                        $this->db->query("DELETE src FROM " . DB_PREFIX . "cart src INNER JOIN " . DB_PREFIX . "cart dst ON (dst.product_id = src.product_id AND dst.recurring_id = src.recurring_id AND dst.`option` = src.`option`) WHERE src.api_id = '0' AND src.customer_id = '0' AND src.session_id = '" . $old_sid . "' AND dst.api_id = '0' AND dst.customer_id = '0' AND dst.session_id = '" . $new_sid . "'");
+
+                        $this->db->query("UPDATE " . DB_PREFIX . "cart SET session_id = '" . $new_sid . "', date_added = NOW() WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $old_sid . "'");
+
+                        $this->db->query("COMMIT");
+                    } else {
+                        // Migrate the session ID AND refresh date_added in one indexed write.
+                        // GC keys off date_added, so a returning guest resets their own 30-day
+                        // window at no extra cost.
+                        $this->db->query("UPDATE " . DB_PREFIX . "cart SET session_id = '" . $new_sid . "', date_added = NOW() WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $old_sid . "'");
+                    }
+
+                    $this->write_cart_cookie($current_session);
                 }
             }
 
-            // Split DELETE queries with LIMIT to prevent InnoDB gap locking and deadlocks
+            // Throttled GC: ~0.1% of requests, split queries, bounded by LIMIT so each
+            // transaction stays short. This reduces lock contention - it does not make
+            // deadlocks impossible. Keep the retry wrapper in system/library/db/mysqli.php.
             if (mt_rand(1, 1000) === 500) {
                 $this->db->query("DELETE FROM " . DB_PREFIX . "cart WHERE api_id > '0' AND date_added < DATE_SUB(NOW(), INTERVAL 720 HOUR) LIMIT 200");
                 $this->db->query("DELETE FROM " . DB_PREFIX . "cart WHERE api_id = '0' AND customer_id = '0' AND date_added < DATE_SUB(NOW(), INTERVAL 720 HOUR) LIMIT 500");
             }
-            // [END] Safe & Optimised Persistent Cart Logic
+            // [END] Persistent guest cart + throttled garbage collection
             ]]></add>
         </operation>
 
         <operation>
             <search><![CDATA[public function getProducts() {]]></search>
             <add position="before"><![CDATA[
+  // Per-instance guard. Cart is constructed once per request in stock OpenCart,
+  // so this is request-scoped in practice. It does NOT synchronise concurrent
+  // HTTP requests, and it is not a deadlock mitigation.
+  private $cart_hash_merged = false;
+
   private function get_cookie_params() {
     return [
       'secure' => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https'),
@@ -58,23 +84,49 @@
     ];
   }
 
-  public function set_cart_cookie() {
-    if (!$this->customer->isLogged()) {
-        if (!isset($_COOKIE['cart_hash']) || $_COOKIE['cart_hash'] != $this->session->getId()) {
-          $p = $this->get_cookie_params();
-          
-          setcookie('cart_hash', $this->session->getId(), [
-              'expires'  => time() + 86400 * 30,
-              'path'     => $p['path'],
-              'domain'   => $p['domain'],
-              'secure'   => $p['secure'],
-              'httponly' => true,
-              'samesite' => 'Lax'
-          ]);
-          
-          $_COOKIE['cart_hash'] = $this->session->getId();
-        }
+  // Returns false when the cookie could not be written. Callers that are about to
+  // move cart rows must check this BEFORE writing, not after.
+  private function write_cart_cookie($session_id) {
+    if (headers_sent()) {
+      return false;
     }
+
+    $p       = $this->get_cookie_params();
+    $expires = time() + 86400 * 30;
+
+    if (PHP_VERSION_ID >= 70300) {
+      setcookie('cart_hash', $session_id, [
+        'expires'  => $expires,
+        'path'     => $p['path'],
+        'domain'   => $p['domain'],
+        'secure'   => $p['secure'],
+        'httponly' => true,
+        'samesite' => 'Lax',
+      ]);
+    } else {
+      setcookie('cart_hash', $session_id, $expires, $p['path'], $p['domain'], $p['secure'], true);
+    }
+
+    $_COOKIE['cart_hash'] = $session_id;
+
+    return true;
+  }
+
+  public function set_cart_cookie() {
+    if ($this->customer->isLogged()) {
+      return;
+    }
+
+    $session_id = $this->session->getId();
+
+    if (!isset($_COOKIE['cart_hash']) || $_COOKIE['cart_hash'] !== $session_id) {
+      $this->write_cart_cookie($session_id);
+    }
+
+    // Sliding TTL. GC deletes by date_added, but stock add()/update() only change
+    // quantity, so an active cart would expire 30 days after the FIRST add. The
+    // 24-hour guard means this normally matches zero rows and costs one indexed lookup.
+    $this->db->query("UPDATE " . DB_PREFIX . "cart SET date_added = NOW() WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $this->db->escape($session_id) . "' AND date_added < DATE_SUB(NOW(), INTERVAL 24 HOUR)");
   }
             ]]></add>
         </operation>
