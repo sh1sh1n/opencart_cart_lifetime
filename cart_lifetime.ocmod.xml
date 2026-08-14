@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <modification>
-    <name>Cart Cookie Hash 2 - Ultimate Edition v1.9</name>
+    <name>Cart Cookie Hash 2 - Ultimate Edition v1.11</name>
     <code>cart_cookie_hash_2_ultimate</code>
-    <version>1.9</version>
+    <version>1.11</version>
     <author>Yoda &amp; Optimised</author>
 
     <file path="system/library/cart/cart.php">
@@ -16,6 +16,11 @@
             // cannot be persisted, the rows must not be moved either - otherwise they end
             // up orphaned on a session ID no cookie points to, and the cart silently
             // disappears once that session expires.
+            //
+            // Note this narrows the window, it does not close it: an HTTP cookie and a SQL
+            // write cannot be made atomic. Cookie-first breaks the other way if the query
+            // then fails. So the cookie is written only after a confirmed merge, and the
+            // residual mismatch is logged rather than pretended away.
             if (isset($_COOKIE['cart_hash']) && !$this->customer->isLogged() && !$this->cart_hash_merged && !headers_sent()) {
                 $cart_hash       = (string)$_COOKIE['cart_hash'];
                 $current_session = $this->session->getId();
@@ -28,32 +33,64 @@
 
                     $old_sid = $this->db->escape($cart_hash);
                     $new_sid = $this->db->escape($current_session);
+                    $merged  = false;
 
-                    // Cheap indexed probe. A collision needs the destination session to already
-                    // hold the same product_id + recurring_id + option, which is rare, so the
-                    // common path stays a single narrow UPDATE.
-                    $collision = $this->db->query("SELECT COUNT(*) AS total FROM " . DB_PREFIX . "cart src INNER JOIN " . DB_PREFIX . "cart dst ON (dst.product_id = src.product_id AND dst.recurring_id = src.recurring_id AND dst.`option` = src.`option`) WHERE src.api_id = '0' AND src.customer_id = '0' AND src.session_id = '" . $old_sid . "' AND dst.api_id = '0' AND dst.customer_id = '0' AND dst.session_id = '" . $new_sid . "'");
+                    try {
+                        // Cheap indexed probe. A collision needs the destination session to
+                        // already hold the same product_id + recurring_id + option, which is
+                        // rare, so the common path stays a single narrow UPDATE.
+                        //
+                        // This is a non-locking read and is NOT concurrency safe: a parallel
+                        // request can insert a colliding row between the probe and the plain
+                        // UPDATE below. See Known Limitations in the README.
+                        $collision = $this->db->query("SELECT COUNT(*) AS total FROM " . DB_PREFIX . "cart src INNER JOIN " . DB_PREFIX . "cart dst ON (dst.product_id = src.product_id AND dst.recurring_id = src.recurring_id AND dst.`option` = src.`option`) WHERE src.api_id = '0' AND src.customer_id = '0' AND src.session_id = '" . $old_sid . "' AND dst.api_id = '0' AND dst.customer_id = '0' AND dst.session_id = '" . $new_sid . "'");
 
-                    if (!empty($collision->row['total'])) {
-                        // Aggregate rather than move blindly, otherwise the customer ends up
-                        // with two identical lines instead of a summed quantity.
-                        $this->db->query("START TRANSACTION");
+                        if (!empty($collision->row['total'])) {
+                            // Aggregate rather than move blindly, otherwise the customer ends
+                            // up with two identical lines instead of a summed quantity.
+                            $this->db->query("START TRANSACTION");
 
-                        $this->db->query("UPDATE " . DB_PREFIX . "cart dst INNER JOIN " . DB_PREFIX . "cart src ON (dst.product_id = src.product_id AND dst.recurring_id = src.recurring_id AND dst.`option` = src.`option`) SET dst.quantity = dst.quantity + src.quantity, dst.date_added = NOW() WHERE dst.api_id = '0' AND dst.customer_id = '0' AND dst.session_id = '" . $new_sid . "' AND src.api_id = '0' AND src.customer_id = '0' AND src.session_id = '" . $old_sid . "'");
+                            $this->db->query("UPDATE " . DB_PREFIX . "cart dst INNER JOIN " . DB_PREFIX . "cart src ON (dst.product_id = src.product_id AND dst.recurring_id = src.recurring_id AND dst.`option` = src.`option`) SET dst.quantity = dst.quantity + src.quantity, dst.date_added = NOW() WHERE dst.api_id = '0' AND dst.customer_id = '0' AND dst.session_id = '" . $new_sid . "' AND src.api_id = '0' AND src.customer_id = '0' AND src.session_id = '" . $old_sid . "'");
 
-                        $this->db->query("DELETE src FROM " . DB_PREFIX . "cart src INNER JOIN " . DB_PREFIX . "cart dst ON (dst.product_id = src.product_id AND dst.recurring_id = src.recurring_id AND dst.`option` = src.`option`) WHERE src.api_id = '0' AND src.customer_id = '0' AND src.session_id = '" . $old_sid . "' AND dst.api_id = '0' AND dst.customer_id = '0' AND dst.session_id = '" . $new_sid . "'");
+                            $this->db->query("DELETE src FROM " . DB_PREFIX . "cart src INNER JOIN " . DB_PREFIX . "cart dst ON (dst.product_id = src.product_id AND dst.recurring_id = src.recurring_id AND dst.`option` = src.`option`) WHERE src.api_id = '0' AND src.customer_id = '0' AND src.session_id = '" . $old_sid . "' AND dst.api_id = '0' AND dst.customer_id = '0' AND dst.session_id = '" . $new_sid . "'");
 
-                        $this->db->query("UPDATE " . DB_PREFIX . "cart SET session_id = '" . $new_sid . "', date_added = NOW() WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $old_sid . "'");
+                            $this->db->query("UPDATE " . DB_PREFIX . "cart SET session_id = '" . $new_sid . "', date_added = NOW() WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $old_sid . "'");
 
-                        $this->db->query("COMMIT");
-                    } else {
-                        // Migrate the session ID AND refresh date_added in one indexed write.
-                        // GC keys off date_added, so a returning guest resets their own 30-day
-                        // window at no extra cost.
-                        $this->db->query("UPDATE " . DB_PREFIX . "cart SET session_id = '" . $new_sid . "', date_added = NOW() WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $old_sid . "'");
+                            $this->db->query("COMMIT");
+                        } else {
+                            // Migrate the session ID AND refresh date_added in one indexed
+                            // write. GC keys off date_added, so a returning guest resets
+                            // their own 30-day window at no extra cost.
+                            $this->db->query("UPDATE " . DB_PREFIX . "cart SET session_id = '" . $new_sid . "', date_added = NOW() WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $old_sid . "'");
+                        }
+
+                        $merged = true;
+                    } catch (\Exception $e) {
+                        // Explicit rollback. Relying on connection teardown is unsafe once a
+                        // retry wrapper or a third-party extension catches the exception.
+                        try {
+                            $this->db->query("ROLLBACK");
+                        } catch (\Exception $ignored) {
+                            // connection already gone - nothing left to roll back
+                        }
+
+                        // Do not rethrow: a failed cart merge must not take down the
+                        // storefront. Rows stay on the old session_id and are picked up on
+                        // a later request, because the cookie is left untouched below.
+                        // Pin the old cart_hash for the rest of this request. Without this,
+                        // a set_cart_cookie() call later in the same request would advance the
+                        // cookie to the current session while the rows are still on the old
+                        // one - recreating exactly the mismatch this catch block prevents.
+                        $this->cart_hash_merge_failed = true;
+
+                        error_log('cart_cookie_hash: guest cart merge failed, cart_hash pinned to previous session_id - ' . $e->getMessage());
                     }
 
-                    $this->write_cart_cookie($current_session);
+                    // Cookie is advanced ONLY after a confirmed merge, so a failed query can
+                    // never leave the pointer ahead of the data.
+                    if ($merged && !$this->write_cart_cookie($current_session)) {
+                        error_log('cart_cookie_hash: cart rows migrated but cart_hash cookie could not be set; cart is reachable for this session only');
+                    }
                 }
             }
 
@@ -76,6 +113,11 @@
   // HTTP requests, and it is not a deadlock mitigation.
   private $cart_hash_merged = false;
 
+  // Set when the migration threw. While true, set_cart_cookie() must not advance
+  // the cart_hash cookie, or the pointer would run ahead of the rows that are
+  // still sitting on the previous session_id.
+  private $cart_hash_merge_failed = false;
+
   private function get_cookie_params() {
     return [
       'secure' => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https'),
@@ -84,8 +126,9 @@
     ];
   }
 
-  // Returns false when the cookie could not be written. Callers that are about to
-  // move cart rows must check this BEFORE writing, not after.
+  // Returns the actual setcookie() result. Callers about to move cart rows must
+  // gate on headers_sent() BEFORE the move; this return value only reports the
+  // residual failure after the fact, which is a logging concern, not a guarantee.
   private function write_cart_cookie($session_id) {
     if (headers_sent()) {
       return false;
@@ -95,7 +138,7 @@
     $expires = time() + 86400 * 30;
 
     if (PHP_VERSION_ID >= 70300) {
-      setcookie('cart_hash', $session_id, [
+      $ok = setcookie('cart_hash', $session_id, [
         'expires'  => $expires,
         'path'     => $p['path'],
         'domain'   => $p['domain'],
@@ -104,12 +147,14 @@
         'samesite' => 'Lax',
       ]);
     } else {
-      setcookie('cart_hash', $session_id, $expires, $p['path'], $p['domain'], $p['secure'], true);
+      $ok = setcookie('cart_hash', $session_id, $expires, $p['path'], $p['domain'], $p['secure'], true);
     }
 
-    $_COOKIE['cart_hash'] = $session_id;
+    if ($ok) {
+      $_COOKIE['cart_hash'] = $session_id;
+    }
 
-    return true;
+    return $ok;
   }
 
   public function set_cart_cookie() {
@@ -119,7 +164,15 @@
 
     $session_id = $this->session->getId();
 
-    if (!isset($_COOKIE['cart_hash']) || $_COOKIE['cart_hash'] !== $session_id) {
+    // Preserve the pointer to rows the failed migration left behind. The format check
+    // is deliberate: a malformed cart_hash points at nothing and SHOULD be replaced,
+    // otherwise garbage would stay pinned for the rest of the request.
+    $pin_previous_hash = $this->cart_hash_merge_failed
+      && isset($_COOKIE['cart_hash'])
+      && $_COOKIE['cart_hash'] !== $session_id
+      && preg_match('/^[a-zA-Z0-9,\-]{22,52}$/D', (string)$_COOKIE['cart_hash']);
+
+    if (!$pin_previous_hash && (!isset($_COOKIE['cart_hash']) || $_COOKIE['cart_hash'] !== $session_id)) {
       $this->write_cart_cookie($session_id);
     }
 
