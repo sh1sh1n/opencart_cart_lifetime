@@ -1,6 +1,6 @@
 # OpenCart Persistent Cart & InnoDB Lock Contention Reduction
 
-**OCMOD v1.9 for OpenCart 3.x** — sharply reduces MySQL/MariaDB deadlock frequency (`Error 1213`) on the `oc_cart` table and provides a 30-day persistent cart for guest users.
+**OCMOD v1.11 for OpenCart 3.x** — sharply reduces MySQL/MariaDB deadlock frequency (`Error 1213`) on the `oc_cart` table and provides a 30-day persistent cart for guest users.
 
 > **Scope, stated honestly:** this modification lowers how often the cart GC runs and how many rows a single GC transaction touches. It makes deadlocks much rarer. It does **not** make them impossible — under InnoDB REPEATABLE READ, concurrent `DELETE` and `INSERT` on the same range can still deadlock. Pair this with a retry wrapper (see below) if you need crash-free behaviour.
 
@@ -83,8 +83,22 @@ Up to 1.8 the migration moved rows verbatim. If the destination session already 
 
 v1.9 probes for a collision with one cheap indexed `SELECT COUNT(*)` first. Collisions are rare, so the common path remains a single narrow `UPDATE`. Only when a collision actually exists does it fall through to a transactional three-statement path: fold quantities into the destination rows, drop the folded source rows, then move whatever is left. The probe matters — multi-table `UPDATE`/`DELETE` with a self-join holds locks on two ranges at once, which is exactly the profile this module otherwise avoids.
 
-### 8. Cookie writability as a precondition (fixed in 1.9)
-`headers_sent()` is now checked **before** any rows are touched, not just before `setcookie()`. Previously, if headers had already been flushed, the rows were migrated to the new session ID while the `cart_hash` cookie still pointed at the old one. Nothing broke immediately — the live session still resolved the cart — but once that session expired, the rows were orphaned and the cart vanished with no log entry. Now, if the pointer cannot be persisted, the rows stay put and are picked up on a later request.
+### 8. Cookie writability as a precondition (1.9, tightened in 1.10)
+`headers_sent()` is checked **before** any rows are touched, not just before `setcookie()`. Previously, if headers had already been flushed, the rows were migrated to the new session ID while the `cart_hash` cookie still pointed at the old one. Nothing broke immediately — the live session still resolved the cart — but once that session expired, the rows were orphaned and the cart vanished with no log entry.
+
+This narrows the window; it does not close it. An HTTP cookie and a SQL write cannot be made atomic — writing the cookie first simply inverts the failure. v1.10 therefore:
+
+- keeps `headers_sent()` as a hard precondition of the whole migration
+- returns the **actual** `setcookie()` result from `write_cart_cookie()` instead of an unconditional `true`, and only updates `$_COOKIE` when the write succeeded
+- advances the cookie **only after a confirmed merge**, so a failed query can never leave the pointer ahead of the data
+- logs the residual mismatch via `error_log()` rather than failing silently
+
+### 9. Explicit rollback and non-fatal merge failure (1.10, completed in 1.11)
+The collision path runs inside `START TRANSACTION` / `COMMIT`, wrapped in `try`/`catch` with an explicit `ROLLBACK`. Relying on PHP process teardown to roll back is unsafe once a retry wrapper or a third-party extension catches the exception first. The exception is **not** rethrown: a failed cart merge should not take down the storefront. The rows stay on the previous `session_id`, the cookie is left untouched, and the merge is retried on a later request.
+
+Leaving the cookie untouched in the constructor was not sufficient on its own. A controller can call `add()` or `update()` later in the **same** request, and the injected `set_cart_cookie()` would then advance `cart_hash` to the current session while the rows were still on the previous one — recreating the exact mismatch the `catch` block exists to prevent. v1.11 sets a request-scoped `$cart_hash_merge_failed` flag in the `catch` and has `set_cart_cookie()` skip the cookie write while it is set, so the pointer stays on the surviving rows until a later request can retry the merge.
+
+The pin is conditional on the existing cookie still matching OpenCart's session ID format. A malformed `cart_hash` points at nothing and should be replaced immediately; pinning it would leave garbage in place for the remainder of the request.
 
 ---
 
@@ -97,7 +111,8 @@ v1.9 probes for a collision with one cheap indexed `SELECT COUNT(*)` first. Coll
 | GC bound | `LIMIT 200` (API carts) / `LIMIT 500` (guest carts) |
 | TTL refresh | On cart modification (max once per 24h per cart) and on successful session migration |
 | Merge behaviour | Quantities aggregated on collision; verbatim move otherwise |
-| Cookie failure mode | Migration skipped entirely if headers already sent — rows never orphaned |
+| Cookie failure mode | Migration skipped if headers already sent; cookie advanced only after a confirmed merge; residual mismatch logged |
+| Merge failure mode | Explicit `ROLLBACK`, logged, not rethrown — rows remain on the previous `session_id`, and `cart_hash` is pinned to it for the rest of the request |
 | Session ID handling | Validated against OpenCart's own format, never rewritten |
 | HTTPS detection | Proxy-aware (`HTTPS` + `X-Forwarded-Proto`) |
 | Cookie flags | `HttpOnly`, `SameSite=Lax`, `Secure` (auto-detected) |
@@ -185,6 +200,7 @@ This OCMOD reduces how often 1213 occurs; the retry is what keeps it from surfac
 
 ## Known Limitations
 
+- **The collision probe is not concurrency safe.** `SELECT COUNT(*)` is a non-locking read taken outside the transaction. A parallel request can insert a colliding row into the destination session between the probe and the plain `UPDATE`, reproducing the duplicate. Aggregation fixes collisions that already exist at probe time; it does not make merge concurrency safe. Closing this would require locking reads (`FOR UPDATE`) around both the probe and the merge — which is precisely the lock contention this module exists to reduce, and under the recommended `READ COMMITTED` there are no gap locks to block the competing insert anyway. This is a deliberate trade-off, not an oversight.
 - The aggregation path assumes at most one row per `product_id` + `recurring_id` + `option` within a session, which is what stock `add()` guarantees. If a third-party extension has inserted duplicates inside a single session, the fold updates the destination once and then deletes all matching source rows, losing the surplus quantity.
 - The collision path issues `START TRANSACTION` / `COMMIT` through the DB adapter. If a deadlock is thrown mid-transaction the connection tears down and the whole merge rolls back, which is the safe outcome — but it depends on the retry wrapper below to avoid surfacing as a fatal.
 - The private-property guard does not coordinate parallel HTTP requests. Two simultaneous requests can both attempt the migration; the second simply matches zero rows.
@@ -192,10 +208,25 @@ This OCMOD reduces how often 1213 occurs; the retry is what keeps it from surfac
 
 ---
 
+## Manual Test: collision path
+
+The aggregation branch will not be hit by organic traffic. Reproduce it deliberately:
+
+1. In session **A**, add a product to the cart.
+2. Start session **B** (new browser profile or cleared `OCSESSID`) and add the **same** product with the **same** options.
+3. In the browser holding session B, overwrite **only** the `cart_hash` cookie with session A's ID.
+4. Reload any storefront page.
+
+Expected result: a single line in B with the quantities summed. Two separate lines means the collision probe did not fire.
+
+---
+
 ## Changelog
 
 | Version | Changes |
 |---|---|
+| **1.11** | **Fix:** a failed merge no longer loses the cart later in the same request. The `catch` in 1.10 preserved the old `cart_hash`, but a subsequent `add()`/`update()` in the same request would have `set_cart_cookie()` overwrite it with the current session ID while the rows were still on the old one. A request-scoped `$cart_hash_merge_failed` flag now pins the previous pointer, gated on the cookie still matching OpenCart's session ID format so a malformed value is still discarded. |
+| **1.10** | **Fix:** `write_cart_cookie()` now returns the real `setcookie()` result instead of an unconditional `true`, and `$_COOKIE` is updated only on success. **Fix:** the cookie is advanced only after a confirmed merge, so a failing query can no longer leave the pointer ahead of the data. **Fix:** explicit `ROLLBACK` in a `catch` around the transactional collision path — process teardown is not a safe rollback mechanism when a retry wrapper or extension catches the exception first; the exception is logged and swallowed rather than rethrown. Documented the collision probe as a known race. Corrected the manual test procedure to use two carts. |
 | **1.9** | **Fix:** merge now aggregates quantities when the destination session already holds the same `product_id` + `recurring_id` + `option`, instead of producing duplicate cart lines — gated behind a cheap collision probe so the common path stays a single `UPDATE`. **Fix:** `headers_sent()` promoted to a precondition of the whole migration; previously rows could be moved while the `cart_hash` cookie could not be updated, orphaning the cart once the session expired. `write_cart_cookie()` now returns `bool`. Corrected the TTL description — the window extends at most once per 24h on cart modification, not on every interaction. |
 | **1.8** | **Fix:** active carts no longer expire 30 days after the first add — `date_added` is now refreshed on cart activity and on session migration (TTL is sliding, throttled to once per 24h). **Fix:** session ID is validated against OpenCart's `/^[a-zA-Z0-9,\-]{22,52}$/` instead of having characters stripped, which corrupted IDs containing `,` or `-`. **Fix:** replaced the session-stored `cart_hash_updated` flag with a private property; the previous one persisted beyond the request despite being documented as request-scoped. Added PHP 7.0–7.2 `setcookie` fallback and a `headers_sent()` guard. Corrected the index recommendation (`idx_cart_gc` composite) and the install-verification command (4 calls, not 5 matches). Documentation claims about eliminating deadlocks and avoiding full scans toned down to what the code actually delivers. |
 | **1.7** | Split GC into two DELETEs with `LIMIT 200/500`; PHP 7.3+ array `setcookie` with `SameSite=Lax`; `mt_rand` for the GC trigger |
