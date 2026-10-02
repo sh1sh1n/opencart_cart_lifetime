@@ -1,211 +1,234 @@
 <?xml version="1.0" encoding="utf-8"?>
 <modification>
-    <name>Cart Cookie Hash 2 - Ultimate Edition v1.11</name>
+    <name>Cart Lifetime - persistent guest cart v2.0</name>
     <code>cart_cookie_hash_2_ultimate</code>
-    <version>1.11</version>
+    <version>2.0</version>
     <author>Yoda &amp; Optimised</author>
 
+    <!--
+        Operation order is deliberate. Stock OCMOD keeps the operations applied before a
+        missing anchor, so every prefix of this list must leave a working Cart class:
+          1. helper methods only (unused until 2);
+          2. stock queries switched to the cart key (self-contained, resolves lazily);
+          3. stock 1-hour GC replaced by the throttled 30-day GC;
+          4-6. sliding lifetime on add/update/remove.
+        error="abort" is NOT used: in OpenCart 3.0.x it executes `break 5`, which also
+        silently skips every modification loaded after this one.
+    -->
     <file path="system/library/cart/cart.php">
 
         <operation>
+            <search><![CDATA[class Cart {]]></search>
+            <add position="after"><![CDATA[	// [cart_lifetime] Persistent guest cart. Contract: see README.
+	const CART_LIFETIME_DAYS = 30;          // guest rows and cookie, counted from last activity
+	const CART_LIFETIME_API_HOURS = 1;      // API (admin order editor) rows, stock value
+	const CART_LIFETIME_TOUCH_HOURS = 24;   // date_added is refreshed at most this often
+	const CART_LIFETIME_GC_DIVISOR = 1000;  // GC runs on ~1/N requests; 0 = off (run it from cron)
+	const CART_LIFETIME_COOKIE = 'cart_lifetime';
+	const CART_LIFETIME_LEGACY_COOKIE = 'cart_hash';
+
+	private $cart_lifetime_key = null;
+	private $cart_lifetime_pending = false;
+
+	// The stock queries use this instead of the session ID. A guest cart is keyed by a
+	// token that does not change when the session does, so concurrent requests that
+	// arrive without a session all resolve to the same rows and nothing is moved.
+	private function cart_lifetime_key() {
+		if ($this->cart_lifetime_key === null) {
+			$this->cart_lifetime_resolve();
+		}
+
+		return $this->cart_lifetime_key;
+	}
+
+	// For code outside this class that queries oc_cart itself (stock PayPal models).
+	public function getLifetimeKey() {
+		return $this->cart_lifetime_key();
+	}
+
+	private function cart_lifetime_resolve() {
+		$session_id = $this->session->getId();
+
+		if (isset($this->session->data['api_id'])) {
+			$this->cart_lifetime_key = $session_id;
+
+			return;
+		}
+
+		$stored = isset($this->session->data['cart_lifetime_key']) ? (string)$this->session->data['cart_lifetime_key'] : '';
+		// is_string(): name[]=x arrives as an array.
+		$cookie = isset($_COOKIE[self::CART_LIFETIME_COOKIE]) && is_string($_COOKIE[self::CART_LIFETIME_COOKIE]) ? $_COOKIE[self::CART_LIFETIME_COOKIE] : '';
+		$legacy = isset($_COOKIE[self::CART_LIFETIME_LEGACY_COOKIE]) && is_string($_COOKIE[self::CART_LIFETIME_LEGACY_COOKIE]) ? $_COOKIE[self::CART_LIFETIME_LEGACY_COOKIE] : '';
+		$restored = false;
+
+		if (preg_match('/^[a-f0-9]{32}$/D', $cookie)) {
+			$key = $cookie;
+			$restored = ($key !== $stored);
+		} elseif (preg_match('/^[a-zA-Z0-9,\-]{22,32}$/D', $legacy)) {
+			// Up to v1.11 the cookie held a raw session ID and the rows are still keyed by it.
+			$key = $this->cart_lifetime_derive($legacy);
+			$restored = $this->cart_lifetime_migrate($legacy, $key);
+
+			if ($restored) {
+				$this->cart_lifetime_setcookie(self::CART_LIFETIME_LEGACY_COOKIE, '', time() - 3600);
+			}
+		} elseif (preg_match('/^[a-f0-9]{32}$/D', $stored)) {
+			$key = $stored;
+		} else {
+			// Derived rather than random, so parallel first requests of one session agree.
+			// The migration picks up rows written under the session ID before installation.
+			$key = $this->cart_lifetime_derive($session_id);
+			$this->cart_lifetime_migrate($session_id, $key);
+		}
+
+		$this->cart_lifetime_key = $key;
+
+		// A failed migration is retried on the next request: do not record the key yet.
+		if (!$this->cart_lifetime_pending) {
+			$this->session->data['cart_lifetime_key'] = $key;
+		}
+
+		if ($restored) {
+			$this->cart_lifetime_touch();
+		}
+	}
+
+	// One-way, so the cookie never discloses a session ID.
+	private function cart_lifetime_derive($session_id) {
+		return substr(hash('sha256', 'cart_lifetime:' . $session_id), 0, 32);
+	}
+
+	// Moves rows verbatim and never deletes, so no quantity can be lost. The target is
+	// derived from the source, so concurrent requests move to the same place and the
+	// later ones simply match nothing.
+	private function cart_lifetime_migrate($from, $to) {
+		try {
+			$found = $this->db->query("SELECT cart_id FROM " . DB_PREFIX . "cart WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $this->db->escape($from) . "' LIMIT 1");
+
+			if ($found->num_rows) {
+				$this->db->query("UPDATE " . DB_PREFIX . "cart SET session_id = '" . $this->db->escape($to) . "', date_added = NOW() WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $this->db->escape($from) . "'");
+			}
+
+			return true;
+		} catch (\Exception $e) {
+			$this->cart_lifetime_pending = true;
+			$this->cart_lifetime_log('migrate', $e);
+
+			return false;
+		}
+	}
+
+	// Sliding lifetime: the cookie and date_added are extended together. The cookie is
+	// rewritten on every call, so it always outlives the rows it points to.
+	private function cart_lifetime_touch() {
+		if (isset($this->session->data['api_id']) || $this->customer->isLogged()) {
+			return;
+		}
+
+		$key = $this->cart_lifetime_key();
+
+		// While a migration is pending the old cookie is the only pointer to the rows.
+		if (!$this->cart_lifetime_pending) {
+			$this->cart_lifetime_setcookie(self::CART_LIFETIME_COOKIE, $key, time() + 86400 * self::CART_LIFETIME_DAYS);
+		}
+
+		try {
+			$this->db->query("UPDATE " . DB_PREFIX . "cart SET date_added = NOW() WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $this->db->escape($key) . "' AND date_added < DATE_SUB(NOW(), INTERVAL " . (int)self::CART_LIFETIME_TOUCH_HOURS . " HOUR)");
+		} catch (\Exception $e) {
+			$this->cart_lifetime_log('touch', $e);
+		}
+	}
+
+	// Housekeeping is best effort: a deadlock here must not fail the page. A real outage
+	// still surfaces through the stock queries that follow.
+	private function cart_lifetime_init() {
+		$this->cart_lifetime_key();
+
+		if (self::CART_LIFETIME_GC_DIVISOR > 0 && mt_rand(1, self::CART_LIFETIME_GC_DIVISOR) === 1) {
+			try {
+				$this->db->query("DELETE FROM " . DB_PREFIX . "cart WHERE api_id > '0' AND date_added < DATE_SUB(NOW(), INTERVAL " . (int)self::CART_LIFETIME_API_HOURS . " HOUR) LIMIT 200");
+				$this->db->query("DELETE FROM " . DB_PREFIX . "cart WHERE api_id = '0' AND customer_id = '0' AND date_added < DATE_SUB(NOW(), INTERVAL " . (int)self::CART_LIFETIME_DAYS . " DAY) LIMIT 500");
+			} catch (\Exception $e) {
+				$this->cart_lifetime_log('gc', $e);
+			}
+		}
+	}
+
+	private function cart_lifetime_setcookie($name, $value, $expires) {
+		if (headers_sent()) {
+			return false;
+		}
+
+		// $_SERVER['HTTPS'] is already normalised by system/startup.php, proxy headers included.
+		$secure = !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off';
+		$path = ini_get('session.cookie_path') ? ini_get('session.cookie_path') : '/';
+		$domain = ini_get('session.cookie_domain') ? ini_get('session.cookie_domain') : '';
+
+		if (PHP_VERSION_ID >= 70300) {
+			return setcookie($name, $value, array(
+				'expires'  => $expires,
+				'path'     => $path,
+				'domain'   => $domain,
+				'secure'   => $secure,
+				'httponly' => true,
+				'samesite' => 'Lax'
+			));
+		}
+
+		return setcookie($name, $value, $expires, $path, $domain, $secure, true);
+	}
+
+	// Never log the message: the stock adapter appends the full SQL, cart keys included.
+	private function cart_lifetime_log($operation, \Exception $e) {
+		$code = $e->getCode();
+
+		if (!$code && preg_match('/Error No: (\d+)/', $e->getMessage(), $match)) {
+			$code = $match[1];
+		}
+
+		error_log('cart_lifetime: ' . $operation . ' failed (' . get_class($e) . ', code ' . (int)$code . ')');
+	}
+]]></add>
+        </operation>
+
+        <operation>
+            <search><![CDATA[$this->db->escape($this->session->getId())]]></search>
+            <add position="replace"><![CDATA[$this->db->escape($this->cart_lifetime_key())]]></add>
+        </operation>
+
+        <operation>
             <search><![CDATA[$this->db->query("DELETE FROM " . DB_PREFIX . "cart WHERE (api_id > '0' OR customer_id = '0') AND date_added < DATE_SUB(NOW(), INTERVAL 1 HOUR)");]]></search>
-            <add position="replace"><![CDATA[
-            // [START] Persistent guest cart + throttled garbage collection
-            //
-            // headers_sent() is a PRECONDITION, not a late check. If the new cart_hash
-            // cannot be persisted, the rows must not be moved either - otherwise they end
-            // up orphaned on a session ID no cookie points to, and the cart silently
-            // disappears once that session expires.
-            //
-            // Note this narrows the window, it does not close it: an HTTP cookie and a SQL
-            // write cannot be made atomic. Cookie-first breaks the other way if the query
-            // then fails. So the cookie is written only after a confirmed merge, and the
-            // residual mismatch is logged rather than pretended away.
-            if (isset($_COOKIE['cart_hash']) && !$this->customer->isLogged() && !$this->cart_hash_merged && !headers_sent()) {
-                $cart_hash       = (string)$_COOKIE['cart_hash'];
-                $current_session = $this->session->getId();
-
-                // OpenCart's own session ID format is /^[a-zA-Z0-9,\-]{22,52}$/ (see Session::start()).
-                // Validate the raw value - never strip characters, or a legitimate ID gets corrupted
-                // and the migration silently matches nothing.
-                if (preg_match('/^[a-zA-Z0-9,\-]{22,52}$/D', $cart_hash) && $cart_hash !== $current_session) {
-                    $this->cart_hash_merged = true;
-
-                    $old_sid = $this->db->escape($cart_hash);
-                    $new_sid = $this->db->escape($current_session);
-                    $merged  = false;
-
-                    try {
-                        // Cheap indexed probe. A collision needs the destination session to
-                        // already hold the same product_id + recurring_id + option, which is
-                        // rare, so the common path stays a single narrow UPDATE.
-                        //
-                        // This is a non-locking read and is NOT concurrency safe: a parallel
-                        // request can insert a colliding row between the probe and the plain
-                        // UPDATE below. See Known Limitations in the README.
-                        $collision = $this->db->query("SELECT COUNT(*) AS total FROM " . DB_PREFIX . "cart src INNER JOIN " . DB_PREFIX . "cart dst ON (dst.product_id = src.product_id AND dst.recurring_id = src.recurring_id AND dst.`option` = src.`option`) WHERE src.api_id = '0' AND src.customer_id = '0' AND src.session_id = '" . $old_sid . "' AND dst.api_id = '0' AND dst.customer_id = '0' AND dst.session_id = '" . $new_sid . "'");
-
-                        if (!empty($collision->row['total'])) {
-                            // Aggregate rather than move blindly, otherwise the customer ends
-                            // up with two identical lines instead of a summed quantity.
-                            $this->db->query("START TRANSACTION");
-
-                            $this->db->query("UPDATE " . DB_PREFIX . "cart dst INNER JOIN " . DB_PREFIX . "cart src ON (dst.product_id = src.product_id AND dst.recurring_id = src.recurring_id AND dst.`option` = src.`option`) SET dst.quantity = dst.quantity + src.quantity, dst.date_added = NOW() WHERE dst.api_id = '0' AND dst.customer_id = '0' AND dst.session_id = '" . $new_sid . "' AND src.api_id = '0' AND src.customer_id = '0' AND src.session_id = '" . $old_sid . "'");
-
-                            $this->db->query("DELETE src FROM " . DB_PREFIX . "cart src INNER JOIN " . DB_PREFIX . "cart dst ON (dst.product_id = src.product_id AND dst.recurring_id = src.recurring_id AND dst.`option` = src.`option`) WHERE src.api_id = '0' AND src.customer_id = '0' AND src.session_id = '" . $old_sid . "' AND dst.api_id = '0' AND dst.customer_id = '0' AND dst.session_id = '" . $new_sid . "'");
-
-                            $this->db->query("UPDATE " . DB_PREFIX . "cart SET session_id = '" . $new_sid . "', date_added = NOW() WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $old_sid . "'");
-
-                            $this->db->query("COMMIT");
-                        } else {
-                            // Migrate the session ID AND refresh date_added in one indexed
-                            // write. GC keys off date_added, so a returning guest resets
-                            // their own 30-day window at no extra cost.
-                            $this->db->query("UPDATE " . DB_PREFIX . "cart SET session_id = '" . $new_sid . "', date_added = NOW() WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $old_sid . "'");
-                        }
-
-                        $merged = true;
-                    } catch (\Exception $e) {
-                        // Explicit rollback. Relying on connection teardown is unsafe once a
-                        // retry wrapper or a third-party extension catches the exception.
-                        try {
-                            $this->db->query("ROLLBACK");
-                        } catch (\Exception $ignored) {
-                            // connection already gone - nothing left to roll back
-                        }
-
-                        // Do not rethrow: a failed cart merge must not take down the
-                        // storefront. Rows stay on the old session_id and are picked up on
-                        // a later request, because the cookie is left untouched below.
-                        // Pin the old cart_hash for the rest of this request. Without this,
-                        // a set_cart_cookie() call later in the same request would advance the
-                        // cookie to the current session while the rows are still on the old
-                        // one - recreating exactly the mismatch this catch block prevents.
-                        $this->cart_hash_merge_failed = true;
-
-                        error_log('cart_cookie_hash: guest cart merge failed, cart_hash pinned to previous session_id - ' . $e->getMessage());
-                    }
-
-                    // Cookie is advanced ONLY after a confirmed merge, so a failed query can
-                    // never leave the pointer ahead of the data.
-                    if ($merged && !$this->write_cart_cookie($current_session)) {
-                        error_log('cart_cookie_hash: cart rows migrated but cart_hash cookie could not be set; cart is reachable for this session only');
-                    }
-                }
-            }
-
-            // Throttled GC: ~0.1% of requests, split queries, bounded by LIMIT so each
-            // transaction stays short. This reduces lock contention - it does not make
-            // deadlocks impossible. Keep the retry wrapper in system/library/db/mysqli.php.
-            if (mt_rand(1, 1000) === 500) {
-                $this->db->query("DELETE FROM " . DB_PREFIX . "cart WHERE api_id > '0' AND date_added < DATE_SUB(NOW(), INTERVAL 720 HOUR) LIMIT 200");
-                $this->db->query("DELETE FROM " . DB_PREFIX . "cart WHERE api_id = '0' AND customer_id = '0' AND date_added < DATE_SUB(NOW(), INTERVAL 720 HOUR) LIMIT 500");
-            }
-            // [END] Persistent guest cart + throttled garbage collection
-            ]]></add>
+            <add position="replace"><![CDATA[$this->cart_lifetime_init();]]></add>
         </operation>
 
         <operation>
-            <search><![CDATA[public function getProducts() {]]></search>
-            <add position="before"><![CDATA[
-  // Per-instance guard. Cart is constructed once per request in stock OpenCart,
-  // so this is request-scoped in practice. It does NOT synchronise concurrent
-  // HTTP requests, and it is not a deadlock mitigation.
-  private $cart_hash_merged = false;
-
-  // Set when the migration threw. While true, set_cart_cookie() must not advance
-  // the cart_hash cookie, or the pointer would run ahead of the rows that are
-  // still sitting on the previous session_id.
-  private $cart_hash_merge_failed = false;
-
-  private function get_cookie_params() {
-    return [
-      'secure' => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https'),
-      'path'   => !empty(ini_get('session.cookie_path')) ? ini_get('session.cookie_path') : '/',
-      'domain' => !empty(ini_get('session.cookie_domain')) ? ini_get('session.cookie_domain') : '',
-    ];
-  }
-
-  // Returns the actual setcookie() result. Callers about to move cart rows must
-  // gate on headers_sent() BEFORE the move; this return value only reports the
-  // residual failure after the fact, which is a logging concern, not a guarantee.
-  private function write_cart_cookie($session_id) {
-    if (headers_sent()) {
-      return false;
-    }
-
-    $p       = $this->get_cookie_params();
-    $expires = time() + 86400 * 30;
-
-    if (PHP_VERSION_ID >= 70300) {
-      $ok = setcookie('cart_hash', $session_id, [
-        'expires'  => $expires,
-        'path'     => $p['path'],
-        'domain'   => $p['domain'],
-        'secure'   => $p['secure'],
-        'httponly' => true,
-        'samesite' => 'Lax',
-      ]);
-    } else {
-      $ok = setcookie('cart_hash', $session_id, $expires, $p['path'], $p['domain'], $p['secure'], true);
-    }
-
-    if ($ok) {
-      $_COOKIE['cart_hash'] = $session_id;
-    }
-
-    return $ok;
-  }
-
-  public function set_cart_cookie() {
-    if ($this->customer->isLogged()) {
-      return;
-    }
-
-    $session_id = $this->session->getId();
-
-    // Preserve the pointer to rows the failed migration left behind. The format check
-    // is deliberate: a malformed cart_hash points at nothing and SHOULD be replaced,
-    // otherwise garbage would stay pinned for the rest of the request.
-    $pin_previous_hash = $this->cart_hash_merge_failed
-      && isset($_COOKIE['cart_hash'])
-      && $_COOKIE['cart_hash'] !== $session_id
-      && preg_match('/^[a-zA-Z0-9,\-]{22,52}$/D', (string)$_COOKIE['cart_hash']);
-
-    if (!$pin_previous_hash && (!isset($_COOKIE['cart_hash']) || $_COOKIE['cart_hash'] !== $session_id)) {
-      $this->write_cart_cookie($session_id);
-    }
-
-    // Sliding TTL. GC deletes by date_added, but stock add()/update() only change
-    // quantity, so an active cart would expire 30 days after the FIRST add. The
-    // 24-hour guard means this normally matches zero rows and costs one indexed lookup.
-    $this->db->query("UPDATE " . DB_PREFIX . "cart SET date_added = NOW() WHERE api_id = '0' AND customer_id = '0' AND session_id = '" . $this->db->escape($session_id) . "' AND date_added < DATE_SUB(NOW(), INTERVAL 24 HOUR)");
-  }
-            ]]></add>
+            <search><![CDATA[public function add($product_id, $quantity = 1, $option = array(), $recurring_id = 0) {]]></search>
+            <add position="after"><![CDATA[		$this->cart_lifetime_touch();]]></add>
         </operation>
 
         <operation>
-            <search trim="true"><![CDATA[public function add($product_id, $quantity = 1, $option = array(), $recurring_id = 0) {]]></search>
-            <add position="after"><![CDATA[
-        $this->set_cart_cookie();]]></add>
+            <search><![CDATA[public function update($cart_id, $quantity) {]]></search>
+            <add position="after"><![CDATA[		$this->cart_lifetime_touch();]]></add>
         </operation>
 
         <operation>
-            <search trim="true"><![CDATA[public function update($cart_id, $quantity) {]]></search>
-            <add position="after"><![CDATA[
-        $this->set_cart_cookie();]]></add>
+            <search><![CDATA[public function remove($cart_id) {]]></search>
+            <add position="after"><![CDATA[		$this->cart_lifetime_touch();]]></add>
         </operation>
 
-        <operation>
-            <search trim="true"><![CDATA[public function remove($cart_id) {]]></search>
-            <add position="after"><![CDATA[
-        $this->set_cart_cookie();]]></add>
-        </operation>
+    </file>
 
-        <operation>
-            <search trim="true"><![CDATA[public function clear() {]]></search>
-            <add position="after"><![CDATA[
-        $this->set_cart_cookie();]]></add>
+    <!--
+        Stock PayPal "buy now" checks hasProductInCart() against oc_cart directly before
+        calling $this->cart->add(). Without this it would look under the session ID, never
+        find the guest's row and add the product a second time. method_exists() keeps the
+        model working if the Cart block above was not applied.
+    -->
+    <file path="catalog/model/extension/payment/paypal.php|catalog/model/extension/module/paypal_smart_button.php">
+
+        <operation error="skip">
+            <search><![CDATA[$this->db->escape($this->session->getId())]]></search>
+            <add position="replace"><![CDATA[$this->db->escape(method_exists($this->cart, 'getLifetimeKey') ? $this->cart->getLifetimeKey() : $this->session->getId())]]></add>
         </operation>
 
     </file>
